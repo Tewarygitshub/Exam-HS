@@ -1,0 +1,1284 @@
+<!--
+exam.html
+Single-file Exam app (HTML + CSS + JS)
+
+IMPORTANT SETUP NOTES (read before using)
+- This file is intentionally frontend-only. To email submissions automatically,
+  replace the EmailJS placeholder values with your own:
+    EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_USER_ID (public key)
+  See the EmailSender class below and the "TODO" markers.
+
+- If you do NOT wish to use EmailJS or do not have keys, the app will
+  automatically fallback to providing a downloadable JSON with the full submission.
+
+- To test camera features locally:
+  - Best: serve via a local server (e.g. `npx http-server` or Python's `python -m http.server`)
+  - Modern browsers require HTTPS or localhost for getUserMedia.
+
+- Privacy: This demo collects small camera snapshots (320x240) and visibility events.
+  Snapshots are stored in localStorage (base64). The app keeps at most 10 snapshots to limit storage.
+
+- Admin data and candidate answers are saved in localStorage under a clear prefix: "examapp_v1_".
+  Admin can export/import questions JSON.
+
+- If you want server-side submission (safer for production), see the commented Node/Express snippet
+  near EmailSender.sendToServer() function in the JS (NOT activated by default).
+
+- Resetting demo: In Admin, there's an Export/Import. To wipe all local data manually you can clear site data in browser devtools.
+
+--------------------------------------------------------------------------------
+This file implements:
+- AdminManager: manage questions (add/edit/remove/import/export)
+- ExamManager: candidate flow, per-question timers, autosave, manual save
+- CameraManager: request camera, snapshot, show/ hide thumbnail
+- CheatDetector: visibilitychange handling, 2 allowed switches, lockout, snapshots on switch
+- EmailSender: EmailJS client integration and fallback to download JSON
+--------------------------------------------------------------------------------
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>ExamApp — Single-file Exam Platform</title>
+<style>
+  :root{
+    --bg: #0f1724;
+    --card: #0b1220;
+    --muted: #94a3b8;
+    --accent: #22c1c3;
+    --accent-2: #7b61ff;
+    --glass: rgba(255,255,255,0.03);
+    --success: #16a34a;
+    --danger: #ef4444;
+    --shadow: 0 8px 24px rgba(2,6,23,0.6);
+    --radius: 14px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", "Courier New", monospace;
+    --ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  }
+  html,body{height:100%;margin:0;font-family:var(--ui);background:linear-gradient(180deg,#071029 0%, #071720 100%);color:#e6eef6}
+  .container{
+    max-width:1200px;margin:40px auto;padding:20px;
+  }
+  header{
+    display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;
+  }
+  .brand{display:flex;gap:12px;align-items:center}
+  .logo{
+    width:56px;height:56px;border-radius:12px;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;font-weight:700;font-size:20px;color:#042a2a;box-shadow:var(--shadow)
+  }
+  h1{font-size:20px;margin:0}
+  .view-toggle{display:flex;gap:8px;border-radius:12px;background:var(--glass);padding:6px;border:1px solid rgba(255,255,255,0.03)}
+  .view-toggle button{background:transparent;border:0;color:var(--muted);padding:8px 10px;border-radius:10px;cursor:pointer}
+  .view-toggle button[aria-pressed="true"]{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#001;box-shadow:0 6px 14px rgba(123,97,255,0.14)}
+  /* layout card */
+  .main{
+    display:flex;gap:20px;align-items:flex-start;
+  }
+  /* Sidebar / progress */
+  .sidebar{
+    width:260px;background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent);padding:14px;border-radius:12px;border:1px solid rgba(255,255,255,0.03);
+    height:calc(50vh);min-height:380px;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:12px
+  }
+  .card{
+    flex:1;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));padding:18px;border-radius:var(--radius);border:1px solid rgba(255,255,255,0.03);box-shadow:var(--shadow);height:calc(50vh);min-height:380px
+  }
+  .progress-bar{height:14px;background:rgba(255,255,255,0.03);border-radius:8px;overflow:hidden}
+  .progress-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--accent),var(--accent-2));transition: width .6s ease}
+  .muted{color:var(--muted);font-size:13px}
+  .controls{display:flex;gap:8px;margin-top:8px}
+  .btn{background:transparent;border:0;padding:8px 12px;border-radius:10px;color:#e6eef6;cursor:pointer}
+  .btn.primary{background:linear-gradient(90deg,var(--accent),var(--accent-2));color:#001}
+  .btn.outline{border:1px solid rgba(255,255,255,0.06)}
+  .btn.danger{background:linear-gradient(90deg,#ff6b6b,#ef4444);color:#fff}
+  /* Exam question layout */
+  .question-header{display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .timer{font-weight:700;font-family:var(--mono);padding:6px 10px;border-radius:8px;background:rgba(255,255,255,0.03)}
+  textarea.code{
+    width:100%;min-height:220px;background:linear-gradient(180deg, rgba(0,0,0,0.35), rgba(255,255,255,0.02));border-radius:10px;border:1px solid rgba(255,255,255,0.03);padding:12px;font-family:var(--mono);color:#dbeafe;font-size:13px;resize:vertical;
+  }
+  .nav{display:flex;justify-content:space-between;margin-top:12px}
+  .small{font-size:13px;color:var(--muted)}
+  /* admin list */
+  .q-list{display:flex;flex-direction:column;gap:8px;overflow:auto;padding-right:6px}
+  .q-item{padding:8px;border-radius:8px;background:rgba(255,255,255,0.02);display:flex;justify-content:space-between;align-items:center;border:1px solid rgba(255,255,255,0.03)}
+  label{display:block;font-size:13px;margin-bottom:6px;color:var(--muted)}
+  input[type="text"],input[type="number"],select{width:100%;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:rgba(255,255,255,0.01);color:inherit}
+  .toast{position:fixed;right:18px;bottom:18px;background:linear-gradient(180deg,#0b1220,#071029);padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,0.03);box-shadow:var(--shadow);color:#fff}
+  .video-thumb{width:140px;height:100px;border-radius:8px;overflow:hidden;border:1px solid rgba(255,255,255,0.04);background:#000;display:flex;align-items:center;justify-content:center}
+  .muted-note{font-size:12px;color:var(--muted);margin-top:6px}
+  /* responsive */
+  @media (max-width:900px){
+    .main{flex-direction:column}
+    .sidebar{width:100%;height:auto}
+    .card{height:auto}
+  }
+  /* subtle animations */
+  .fade-in{animation:fadeIn .45s ease both}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  .danger-pill{background:rgba(239,68,68,0.14);padding:6px 10px;border-radius:10px;color:var(--danger);font-weight:700}
+  .success-pill{background:rgba(16,185,129,0.12);padding:6px 10px;border-radius:10px;color:var(--success);font-weight:700}
+  footer{margin-top:14px;color:var(--muted);font-size:13px;text-align:center}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <div class="logo" aria-hidden="true">EX</div>
+        <div>
+          <h1>Exam-HS</h1>
+          <div class="muted">Online preparation</div>
+        </div>
+      </div>
+
+      <div class="view-toggle" role="tablist" aria-label="Switch between Admin and Exam views">
+        <button id="adminBtn" role="tab" aria-pressed="false">Admin</button>
+        <button id="examBtn" role="tab" aria-pressed="true">Exam</button>
+      </div>
+    </header>
+
+    <main class="main" role="main">
+      <!-- Sidebar / Progress -->
+      <aside class="sidebar" aria-label="Progress & Info">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div><strong>Progress</strong><div class="muted small">Questions saved / total</div></div>
+          <div id="switchCounterBadge" class="muted small" aria-live="polite"></div>
+        </div>
+
+        <div style="margin-top:10px">
+          <div class="progress-bar" aria-hidden="true"><div id="progressFill" class="progress-fill" style="width:0%"></div></div>
+          <div id="progressText" class="small muted" style="margin-top:8px">0 / 0 saved</div>
+        </div>
+
+        <div style="margin-top:12px">
+          <strong>Camera</strong>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+            <div id="videoContainer" class="video-thumb" aria-hidden="true">
+              <video id="liveVideo" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover"></video>
+            </div>
+            <div style="flex:1">
+              <div><button id="toggleVideoBtn" class="btn outline small">Hide thumbnail</button></div>
+              <div class="muted-note">Thumbnails are used for integrity snapshots. No audio is recorded.</div>
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top:12px">
+          <strong>Save / Autosave</strong>
+          <div class="muted-note">Answers autosave every 15s; click Save to store immediately.</div>
+          <div id="saveIndicator" class="muted-note" style="margin-top:6px">Not saved yet</div>
+        </div>
+
+        <div style="margin-top:12px">
+          <strong>Cheating Policy</strong>
+          <div class="muted-note">You are allowed up to <strong>2</strong> screen switches. The 3rd will lock the exam and capture evidence.</div>
+        </div>
+
+        <div style="margin-top:auto;display:flex;gap:8px">
+          <button id="exportAllBtn" class="btn outline">Export Questions</button>
+          <button id="importAllBtn" class="btn">Import</button>
+        </div>
+      </aside>
+
+      <!-- Main card -->
+      <section class="card" id="mainCard" aria-live="polite">
+        <!-- ADMIN VIEW -->
+        <div id="adminView" class="fade-in" role="tabpanel" aria-hidden="true">
+          <h2>Admin — Manage Questions</h2>
+          <div style="display:flex;gap:12px;margin-top:12px">
+            <div style="flex:1">
+              <label for="qType">Type</label>
+              <select id="qType">
+                <option value="coding">Coding</option>
+                <option value="dbms">DBMS</option>
+              </select>
+              <label for="qPrompt" style="margin-top:8px">Prompt (HTML allowed)</label>
+              <textarea id="qPrompt" rows="5" placeholder="Enter question prompt or HTML"></textarea>
+              <label for="qTime" style="margin-top:8px">Time limit (seconds)</label>
+              <input id="qTime" type="number" min="10" value="300"/>
+              <div style="margin-top:8px;display:flex;gap:8px">
+                <button id="addQBtn" class="btn primary">Add Question</button>
+                <button id="clearInputsBtn" class="btn outline">Clear</button>
+              </div>
+            </div>
+            <div style="width:420px">
+              <label>Existing Questions</label>
+              <div id="qList" class="q-list" tabindex="0" aria-label="Question list"></div>
+              <div style="display:flex;gap:8px;margin-top:10px">
+                <button id="seedExampleBtn" class="btn">Seed Demo</button>
+                <button id="deleteAllQBtn" class="btn danger">Delete All</button>
+              </div>
+            </div>
+          </div>
+
+          <div style="margin-top:18px">
+            <strong>Import / Export Questions</strong>
+            <div class="muted-note">Export questions to JSON for backup, or import a JSON file with the same format.</div>
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <button id="exportQuestionsBtn" class="btn outline">Export JSON</button>
+              <input id="importFile" type="file" accept="application/json" class="hidden"/>
+              <button id="pickImportBtn" class="btn">Pick JSON to Import</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- EXAM VIEW -->
+        <div id="examView" class="fade-in" role="tabpanel" aria-hidden="false">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <h2 id="questionTitle">Question</h2>
+              <div class="muted small" id="questionMeta">Type — #1</div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <div class="timer" id="timerDisplay" aria-live="polite">00:00</div>
+              <div id="statusPill" class="success-pill" hidden>Active</div>
+            </div>
+          </div>
+
+          <hr style="border:none;border-top:1px solid rgba(255,255,255,0.04);margin:12px 0"/>
+
+          <div id="promptArea" class="muted-note" style="margin-bottom:12px">Loading question...</div>
+
+          <label for="solutionBox" class="small">Your solution</label>
+          <textarea id="solutionBox" class="code" aria-label="Solution editor"></textarea>
+
+          <div class="nav">
+            <div>
+              <button id="prevBtn" class="btn outline">Previous</button>
+              <button id="saveBtn" class="btn primary">Save</button>
+              <button id="nextBtn" class="btn outline">Next</button>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px">
+              <div id="autosaveText" class="small muted">Autosave every 15s</div>
+              <div id="remainingSwitches" class="small muted"></div>
+            </div>
+          </div>
+
+          <div style="margin-top:12px;display:flex;justify-content:space-between;align-items:center">
+            <div class="muted-note">Progress: <span id="qNumText">0 / 0</span></div>
+            <div>
+              <button id="submitAllBtn" class="btn primary hidden">Submit All</button>
+            </div>
+          </div>
+
+          <div id="lockedMessage" class="muted-note danger-pill hidden" style="margin-top:12px">Exam locked due to screen switching. Export evidence and contact your proctor.</div>
+        </div>
+      </section>
+    </main>
+
+    <footer>By using this demo you consent to small snapshots and visibility logging for exam integrity.</footer>
+  </div>
+
+  <!-- Toast template -->
+  <div id="toastContainer" aria-live="polite"></div>
+
+<script>
+/* ============================================================
+   ExamApp - Single File
+   - Key localStorage prefix: examapp_v1_
+   - Modules/Classes: AdminManager, CameraManager, CheatDetector, ExamManager, EmailSender
+   ============================================================ */
+
+(() => {
+  // localStorage keys
+  const PREFIX = 'examapp_v1_';
+  const QUESTIONS_KEY = PREFIX + 'questions';
+  const ANSWERS_KEY = PREFIX + 'answers'; // object by questionId -> {answer, savedAt, timedOut}
+  const SNAPSHOTS_KEY = PREFIX + 'snapshots'; // array of {data, ts, reason}
+  const SWITCH_COUNT_KEY = PREFIX + 'switchCount'; // integer
+  const EXAM_STATUS_KEY = PREFIX + 'examStatus'; // normal | locked_due_to_switches | submitted
+  const SESSION_ID_KEY = PREFIX + 'sessionId';
+  const METADATA_KEY = PREFIX + 'meta'; // {startTime, endTime, autosaves: []}
+  const MAX_SNAPSHOTS = 10;
+
+  /* ------------------------
+     Utility functions
+     ------------------------ */
+  function uid(prefix='u') {
+    return prefix + '_' + Math.random().toString(36).slice(2,9);
+  }
+  function nowISO(){ return new Date().toISOString(); }
+  function showToast(msg, timeout=3500){
+    const el = document.createElement('div');
+    el.className = 'toast fade-in';
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(()=> el.style.opacity = '0.0', timeout - 400);
+    setTimeout(()=> el.remove(), timeout);
+  }
+  function safeParseJSON(s){ try { return JSON.parse(s); } catch(e){ return null; } }
+  function clamp(n,a,b){return Math.max(a,Math.min(b,n));}
+  function formatTimeSec(s){
+    if(s<0) s=0;
+    const m = Math.floor(s/60); const sec = Math.floor(s%60);
+    return String(m).padStart(2,'0') + ':' + String(sec).padStart(2,'0');
+  }
+
+  /* ------------------------
+     AdminManager - manage question CRUD
+     ------------------------ */
+  class AdminManager {
+    constructor(){
+      this.questions = this.loadQuestions() || [];
+      this.bindUI();
+      this.renderList();
+    }
+    loadQuestions(){
+      const raw = localStorage.getItem(QUESTIONS_KEY);
+      if(!raw) return null;
+      return safeParseJSON(raw) || [];
+    }
+    saveQuestions(){
+      localStorage.setItem(QUESTIONS_KEY, JSON.stringify(this.questions));
+      dispatchAppEvent('questionsUpdated');
+    }
+    addQuestion(q){
+      this.questions.push(q);
+      this.saveQuestions();
+      this.renderList();
+    }
+    updateQuestion(id, patch){
+      const idx = this.questions.findIndex(x=>x.id===id);
+      if(idx>=0){
+        this.questions[idx] = {...this.questions[idx], ...patch};
+        this.saveQuestions();
+        this.renderList();
+      }
+    }
+    removeQuestion(id){
+      this.questions = this.questions.filter(x=>x.id!==id);
+      this.saveQuestions();
+      this.renderList();
+    }
+    clearAll(){
+      if(!confirm('Delete all questions? This cannot be undone.')) return;
+      this.questions = [];
+      this.saveQuestions();
+      this.renderList();
+    }
+    importFromJSON(json){
+      // Validate basic shape
+      if(!Array.isArray(json)) throw new Error('Invalid questions JSON (expected array)');
+      for(const q of json){
+        if(!q.id) q.id = uid('q');
+        if(!q.type || !['coding','dbms'].includes(q.type)) q.type='dbms';
+        if(!q.timeLimitSeconds || typeof q.timeLimitSeconds !== 'number') q.timeLimitSeconds = 300;
+        if(!q.prompt) q.prompt = 'No prompt provided';
+      }
+      this.questions = json;
+      this.saveQuestions();
+      this.renderList();
+    }
+
+    exportJSON(){
+      const blob = new Blob([JSON.stringify(this.questions, null, 2)], {type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = 'questions_export.json';
+      document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    }
+
+    seedDemo(){
+      // Sample data (3 questions)
+      this.questions = [
+        {
+    id: "q1",
+    type: "coding",
+    prompt: `
+<strong>Given an array of integers nums and an integer target, return indices of the two numbers such that they add up to target.</strong><br><br>
+You may assume that each input would have exactly one solution, and you may not use the same element twice.<br>
+You can return the answer in any order.<br><br>
+<b>Example 1:</b><br>
+Input: nums = [2,7,11,15], target = 9<br>
+Output: [0,1]<br>
+Explanation: Because nums[0] + nums[1] == 9, we return [0, 1].<br><br>
+<b>Example 2:</b><br>
+Input: nums = [3,2,4], target = 6<br>
+Output: [1,2]<br><br>
+<b>Example 3:</b><br>
+Input: nums = [3,3], target = 6<br>
+Output: [0,1]
+    `,
+    timeLimitSeconds: 1800,
+  },
+  {
+    id: "q2",
+    type: "coding",
+    prompt: `
+<strong>Given a string s consisting of words and spaces, return the length of the last word in the string.</strong><br><br>
+A word is a maximal substring consisting of non-space characters only.<br><br>
+<b>Example 1:</b><br>
+Input: s = "Hello World"<br>
+Output: 5<br><br>
+<b>Example 2:</b><br>
+Input: s = "   fly me   to   the moon  "<br>
+Output: 4<br><br>
+<b>Example 3:</b><br>
+Input: s = "luffy is still joyboy"<br>
+Output: 6
+    `,
+    timeLimitSeconds: 1800,
+  },
+  {
+    id: "q3",
+    type: "coding",
+    prompt: `
+<strong>Given an array nums of size n, return the majority element.</strong><br><br>
+The majority element is the element that appears more than ⌊n / 2⌋ times. You may assume that the majority element always exists in the array.<br><br>
+<b>Example 1:</b><br>
+Input: nums = [3,2,3]<br>
+Output: 3<br><br>
+<b>Example 2:</b><br>
+Input: nums = [2,2,1,1,1,2,2]<br>
+Output: 2
+    `,
+    timeLimitSeconds: 1800,
+  },
+  {
+    id: "q4",
+    type: "dbms",
+    prompt: `
+<strong>Write a solution to report all the duplicate emails.</strong><br>
+Note that it's guaranteed that the email field is not NULL.<br><br>
+<b>Example:</b><br>
+Input:<br>
+Person table:<br>
++----+---------+<br>
+| id | email   |<br>
++----+---------+<br>
+| 1  | a@b.com |<br>
+| 2  | c@d.com |<br>
+| 3  | a@b.com |<br>
++----+---------+<br><br>
+Output:<br>
++---------+<br>
+| Email   |<br>
++---------+<br>
+| a@b.com |<br>
++---------+<br>
+Explanation: a@b.com is repeated two times.
+    `,
+    timeLimitSeconds: 1800,
+  },
+  {
+    id: "q5",
+    type: "dbms",
+    prompt: `
+<strong>A single number is a number that appeared only once in the MyNumbers table.</strong><br>
+Find the largest single number. If there is no single number, report null.<br><br>
+<b>Example 1:</b><br>
+Input:<br>
+MyNumbers table:<br>
++-----+<br>
+| num |<br>
++-----+<br>
+| 8   |<br>
+| 8   |<br>
+| 3   |<br>
+| 3   |<br>
+| 1   |<br>
+| 4   |<br>
+| 5   |<br>
+| 6   |<br>
++-----+<br><br>
+Output:<br>
++-----+<br>
+| num |<br>
++-----+<br>
+| 6   |<br>
++-----+<br>
+Explanation: The single numbers are 1, 4, 5, and 6. Since 6 is the largest single number, we return it.<br><br>
+<b>Example 2:</b><br>
+Input:<br>
+MyNumbers table:<br>
++-----+<br>
+| num |<br>
++-----+<br>
+| 8   |<br>
+| 8   |<br>
+| 7   |<br>
+| 7   |<br>
+| 3   |<br>
+| 3   |<br>
+| 3   |<br>
++-----+<br><br>
+Output:<br>
++------+<br>
+| num  |<br>
++------+<br>
+| null |<br>
++------+<br>
+Explanation: There are no single numbers in the input table so we return null.
+    `,
+    timeLimitSeconds: 1800,
+  },
+  {
+    id: "q6",
+    type: "dbms",
+    prompt: `
+<strong>Write a solution that will, for each user, return the number of followers.</strong><br><br>
+Return the result table ordered by user_id in ascending order.<br><br>
+<b>Example:</b><br>
+Input:<br>
+Followers table:<br>
++---------+-------------+<br>
+| user_id | follower_id |<br>
++---------+-------------+<br>
+| 0       | 1           |<br>
+| 1       | 0           |<br>
+| 2       | 0           |<br>
+| 2       | 1           |<br>
++---------+-------------+<br><br>
+Output:<br>
++---------+----------------+<br>
+| user_id | followers_count|<br>
++---------+----------------+<br>
+| 0       | 1              |<br>
+| 1       | 1              |<br>
+| 2       | 2              |<br>
++---------+----------------+<br>
+Explanation:<br>
+The followers of 0 are {1}<br>
+The followers of 1 are {0}<br>
+The followers of 2 are {0,1}
+    `,
+    timeLimitSeconds: 1800,
+  }
+    ];
+      this.saveQuestions();
+      this.renderList();
+      showToast('Sample questions seeded');
+    }
+
+    bindUI(){
+      // DOM elements
+      const addQBtn = document.getElementById('addQBtn');
+      const qType = document.getElementById('qType');
+      const qPrompt = document.getElementById('qPrompt');
+      const qTime = document.getElementById('qTime');
+      const clearInputsBtn = document.getElementById('clearInputsBtn');
+      const qListEl = document.getElementById('qList');
+      const exportQuestionsBtn = document.getElementById('exportQuestionsBtn');
+      const pickImportBtn = document.getElementById('pickImportBtn');
+      const importFile = document.getElementById('importFile');
+      const seedExampleBtn = document.getElementById('seedExampleBtn');
+      const deleteAllQBtn = document.getElementById('deleteAllQBtn');
+      const exportAllBtn = document.getElementById('exportAllBtn');
+      const importAllBtn = document.getElementById('importAllBtn');
+
+      addQBtn.addEventListener('click', ()=>{
+        const type = qType.value;
+        const prompt = qPrompt.value.trim();
+        const timeLimitSeconds = parseInt(qTime.value,10);
+        if(!prompt){ alert('Prompt is required'); return; }
+        if(isNaN(timeLimitSeconds) || timeLimitSeconds < 10){ alert('Time limit must be >= 10 seconds'); return; }
+        const newQ = { id: uid('q'), type, prompt, timeLimitSeconds };
+        this.addQuestion(newQ);
+        qPrompt.value=''; qTime.value='300';
+        showToast('Question added');
+      });
+
+      clearInputsBtn.addEventListener('click', ()=>{ qPrompt.value=''; qTime.value='300'; qType.value='coding' });
+
+      exportQuestionsBtn.addEventListener('click', ()=> this.exportJSON());
+      pickImportBtn.addEventListener('click', ()=> { importFile.click(); });
+      importFile.addEventListener('change', (ev)=>{
+        const f = ev.target.files[0];
+        if(!f) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          try{
+            const data = JSON.parse(reader.result);
+            this.importFromJSON(data);
+            showToast('Questions imported');
+          }catch(e){ alert('Invalid JSON file'); }
+        };
+        reader.readAsText(f);
+      });
+
+      seedExampleBtn.addEventListener('click', ()=> this.seedDemo());
+      deleteAllQBtn.addEventListener('click', ()=> this.clearAll());
+      exportAllBtn.addEventListener('click', ()=> this.exportJSON());
+      importAllBtn.addEventListener('click', ()=> { importFile.click(); });
+
+      // expose qList El for rendering
+      this.qListEl = qListEl;
+    }
+
+    renderList(){
+      const el = this.qListEl;
+      el.innerHTML = '';
+      if(!this.questions.length){
+        el.innerHTML = '<div class="muted">No questions yet. Add one using the form.</div>';
+        dispatchAppEvent('questionsUpdated');
+        return;
+      }
+      this.questions.forEach((q, idx)=>{
+        const item = document.createElement('div');
+        item.className = 'q-item';
+        const left = document.createElement('div');
+        left.innerHTML = `<div style="font-weight:700">${idx+1}. ${q.type.toUpperCase()}</div><div class="muted small">${(q.prompt||'').slice(0,80).replace(/<[^>]*>?/gm,'')}...</div>`;
+        const right = document.createElement('div');
+        right.style.display='flex'; right.style.gap='6px';
+        const editBtn = document.createElement('button'); editBtn.className='btn'; editBtn.textContent='Edit';
+        const delBtn = document.createElement('button'); delBtn.className='btn outline'; delBtn.textContent='Delete';
+        const upBtn = document.createElement('button'); upBtn.className='btn'; upBtn.textContent='↑';
+        const downBtn = document.createElement('button'); downBtn.className='btn'; downBtn.textContent='↓';
+        right.append(upBtn, downBtn, editBtn, delBtn);
+        item.append(left, right);
+
+        // events
+        editBtn.addEventListener('click', ()=>{
+          const newPrompt = prompt('Edit prompt (HTML allowed):', q.prompt);
+          if(newPrompt===null) return;
+          const newTime = prompt('Time in seconds:', q.timeLimitSeconds);
+          if(newTime===null) return;
+          const parsed = parseInt(newTime,10);
+          if(isNaN(parsed) || parsed<10){ alert('Invalid time'); return; }
+          this.updateQuestion(q.id, { prompt: newPrompt, timeLimitSeconds: parsed });
+          showToast('Question updated');
+        });
+        delBtn.addEventListener('click', ()=>{
+          if(confirm('Delete this question?')){ this.removeQuestion(q.id); showToast('Deleted'); }
+        });
+        upBtn.addEventListener('click', ()=>{
+          const i = this.questions.findIndex(x=>x.id===q.id);
+          if(i>0){ const tmp=this.questions[i-1]; this.questions[i-1]=this.questions[i]; this.questions[i]=tmp; this.saveQuestions(); this.renderList();}
+        });
+        downBtn.addEventListener('click', ()=>{
+          const i = this.questions.findIndex(x=>x.id===q.id);
+          if(i<this.questions.length-1){ const tmp=this.questions[i+1]; this.questions[i+1]=this.questions[i]; this.questions[i]=tmp; this.saveQuestions(); this.renderList();}
+        });
+
+        el.appendChild(item);
+      });
+
+      dispatchAppEvent('questionsUpdated');
+    }
+  }
+
+  /* ------------------------
+     CameraManager - request camera & snapshots
+     ------------------------ */
+  class CameraManager {
+    constructor(){
+      this.stream = null;
+      this.enabled = false;
+      this.videoEl = document.getElementById('liveVideo');
+      this.videoContainer = document.getElementById('videoContainer');
+      this.toggleBtn = document.getElementById('toggleVideoBtn');
+      this.thumbnailVisible = true;
+      this.bindUI();
+    }
+    async requestCamera(){
+      if(this.stream) return this.stream;
+      try{
+        const s = await navigator.mediaDevices.getUserMedia({video: {width:320, height:240}, audio:false});
+        this.stream = s;
+        this.videoEl.srcObject = s;
+        this.enabled = true;
+        return s;
+      }catch(err){
+        this.enabled = false;
+        this.stream = null;
+        console.warn('camera denied', err);
+        throw err;
+      }
+    }
+    stopCamera(){
+      if(this.stream){
+        this.stream.getTracks().forEach(t=>t.stop());
+        this.stream = null;
+        this.videoEl.srcObject = null;
+        this.enabled = false;
+      }
+    }
+    snapshotSmall(){
+      // returns base64 data URL resized to 320x240
+      if(!this.stream || !this.videoEl) return null;
+      const w = 320, h = 240;
+      const c = document.createElement('canvas'); c.width=w; c.height=h;
+      const ctx = c.getContext('2d');
+      try{
+        ctx.drawImage(this.videoEl, 0,0,w,h);
+        return c.toDataURL('image/jpeg', 0.7);
+      }catch(e){
+        console.warn('snapshot failed', e);
+        return null;
+      }
+    }
+    bindUI(){
+      this.toggleBtn.addEventListener('click', ()=>{
+        this.thumbnailVisible = !this.thumbnailVisible;
+        document.getElementById('videoContainer').style.display = this.thumbnailVisible ? 'block' : 'none';
+        this.toggleBtn.textContent = this.thumbnailVisible ? 'Hide thumbnail' : 'Show thumbnail';
+      });
+    }
+  }
+
+  /* ------------------------
+     CheatDetector - visibility events & lockout
+     ------------------------ */
+  class CheatDetector {
+    constructor(cameraManager){
+      this.camera = cameraManager;
+      this.maxAllowed = 2; // allowed switches
+      this.count = parseInt(localStorage.getItem(SWITCH_COUNT_KEY) || '0',10);
+      this.locked = (localStorage.getItem(EXAM_STATUS_KEY) === 'locked_due_to_switches');
+      this.bind();
+    }
+    bind(){
+      document.addEventListener('visibilitychange', ()=> this.onVisibilityChange());
+      // also track blur/focus for additional detection (best-effort)
+      window.addEventListener('blur', ()=> this.onVisibilityChange('blur'));
+      window.addEventListener('focus', ()=> this.onFocus());
+      this.syncUI();
+    }
+    syncUI(){
+      const badge = document.getElementById('switchCounterBadge');
+      badge.textContent = `Switches: ${this.count}/${this.maxAllowed}`;
+      const rem = document.getElementById('remainingSwitches');
+      rem.textContent = (this.count>=1) ? `Remaining switches: ${Math.max(0,this.maxAllowed-this.count)}` : '';
+    }
+    async onVisibilityChange(source){
+      if(this.locked) return;
+      if(document.hidden){
+        // switched away
+        this.count++;
+        localStorage.setItem(SWITCH_COUNT_KEY, String(this.count));
+        dispatchAppEvent('switchCountUpdated');
+        // capture snapshot if camera available
+        let snap = null;
+        try{ snap = this.camera.snapshotSmall(); }catch(e){}
+        const snapshots = loadSnapshots();
+        if(snap) snapshots.push({ data: snap, ts: nowISO(), reason: 'visibilitychange' });
+        // keep only last N
+        while(snapshots.length > MAX_SNAPSHOTS) snapshots.shift();
+        saveSnapshots(snapshots);
+        // toast
+        if(this.count <= this.maxAllowed){
+          showToast(`Warning: You have switched away ${this.count} of ${this.maxAllowed} allowed times.`);
+        } else {
+          // exceeded allowed -> lock exam
+          await this.lockExam('exceeded_switches');
+        }
+        this.syncUI();
+      }
+    }
+    async onFocus(){
+      // when user returns - we might show a gentle reminder
+      if(this.locked) return;
+      // nothing else for now
+    }
+    async lockExam(reason='locked'){
+      this.locked = true;
+      localStorage.setItem(EXAM_STATUS_KEY, 'locked_due_to_switches');
+      // snapshot final evidence
+      const finalSnap = this.camera.snapshotSmall();
+      if(finalSnap){
+        const snaps = loadSnapshots();
+        snaps.push({ data: finalSnap, ts: nowISO(), reason: 'locked_final' });
+        while(snaps.length > MAX_SNAPSHOTS) snaps.shift();
+        saveSnapshots(snaps);
+      }
+      // disable inputs via event
+      dispatchAppEvent('examLocked', { reason });
+      showToast('Exam locked due to policy violation');
+      this.syncUI();
+    }
+    reset(){
+      this.count = 0;
+      localStorage.setItem(SWITCH_COUNT_KEY, '0');
+      localStorage.setItem(EXAM_STATUS_KEY, 'normal');
+      this.locked = false;
+      dispatchAppEvent('switchCountUpdated');
+      showToast('Switch counter reset');
+      this.syncUI();
+    }
+  }
+
+  /* ------------------------
+     ExamManager - handles candidate flow, timers, autosave
+     ------------------------ */
+  class ExamManager {
+    constructor(cameraManager, cheatDetector){
+      this.camera = cameraManager;
+      this.cheat = cheatDetector;
+      this.questions = loadQuestions() || [];
+      this.currentIndex = 0;
+      this.timers = {}; // questionId -> remainingSeconds
+      this.timerInterval = null;
+      this.autosaveInterval = null;
+      this.answers = loadAnswers() || {}; // questionId -> {answer, savedAt, timedOut}
+      this.sessionId = localStorage.getItem(SESSION_ID_KEY) || uid('sess');
+      localStorage.setItem(SESSION_ID_KEY, this.sessionId);
+      // metadata
+      this.meta = loadMeta() || { startTime: nowISO(), endTime: null, autosaves: [] };
+      localStorage.setItem(METADATA_KEY, JSON.stringify(this.meta));
+      this.bindUI();
+      this.initTimersFromQuestions();
+      this.updateProgressUI();
+      this.renderQuestion();
+      this.startAutosave();
+      this.startTimerTick();
+      // show exam status
+      if(localStorage.getItem(EXAM_STATUS_KEY) === 'locked_due_to_switches'){
+        dispatchAppEvent('examLocked', { reason: 'previous_lock' });
+      }
+    }
+
+    bindUI(){
+      this.solutionBox = document.getElementById('solutionBox');
+      this.promptArea = document.getElementById('promptArea');
+      this.questionTitle = document.getElementById('questionTitle');
+      this.questionMeta = document.getElementById('questionMeta');
+      this.timerDisplay = document.getElementById('timerDisplay');
+      this.prevBtn = document.getElementById('prevBtn');
+      this.nextBtn = document.getElementById('nextBtn');
+      this.saveBtn = document.getElementById('saveBtn');
+      this.saveIndicator = document.getElementById('saveIndicator');
+      this.qNumText = document.getElementById('qNumText');
+      this.submitAllBtn = document.getElementById('submitAllBtn');
+      this.lockedMessage = document.getElementById('lockedMessage');
+
+      this.prevBtn.addEventListener('click', ()=> this.go(-1));
+      this.nextBtn.addEventListener('click', ()=> this.go(1));
+      this.saveBtn.addEventListener('click', ()=> this.saveCurrentAnswer());
+      this.submitAllBtn.addEventListener('click', ()=> this.submitAll());
+
+      // external events
+      document.addEventListener('questionsUpdated', ()=>{ this.questions = loadQuestions() || []; this.initTimersFromQuestions(); this.updateProgressUI(); this.renderQuestion(); });
+      document.addEventListener('switchCountUpdated', ()=> this.updateSwitchUI());
+      document.addEventListener('examLocked', (e)=> this.onLock(e && e.detail));
+    }
+
+    initTimersFromQuestions(){
+      // initialize remaining time from saved answers or question time limit
+      this.questions.forEach(q=>{
+        if(!this.timers[q.id]){
+          this.timers[q.id] = q.timeLimitSeconds;
+        }
+      });
+    }
+
+    startTimerTick(){
+      if(this.timerInterval) return;
+      this.timerInterval = setInterval(()=>{
+        // don't tick if locked or submitted
+        if(localStorage.getItem(EXAM_STATUS_KEY) === 'locked_due_to_switches' || localStorage.getItem(EXAM_STATUS_KEY) === 'submitted') return;
+        const q = this.questions[this.currentIndex];
+        if(!q) return;
+        const qid = q.id;
+        this.timers[qid] = this.timers[qid] - 1;
+        if(this.timers[qid] <= 0){
+          // mark timed out, auto-save and move to next
+          this.markTimedOut(qid);
+          this.saveAnswer(qid, this.solutionBox.value || '');
+          showToast('Time up for this question — auto-saved and moving on.');
+          this.go(1);
+          return;
+        }
+        // update display if current
+        if(this.questions[this.currentIndex] && this.questions[this.currentIndex].id === qid){
+          this.timerDisplay.textContent = formatTimeSec(this.timers[qid]);
+        }
+      }, 1000);
+    }
+
+    startAutosave(){
+      if(this.autosaveInterval) return;
+      this.autosaveInterval = setInterval(()=> {
+        // autosave current answer only
+        if(localStorage.getItem(EXAM_STATUS_KEY) === 'locked_due_to_switches' || localStorage.getItem(EXAM_STATUS_KEY) === 'submitted') return;
+        const q = this.questions[this.currentIndex];
+        if(!q) return;
+        const qid = q.id;
+        const txt = this.solutionBox.value || '';
+        this.saveAnswer(qid, txt, true);
+        // record autosave meta
+        const meta = loadMeta();
+        meta.autosaves = meta.autosaves || [];
+        meta.autosaves.push({ qid, ts: nowISO() });
+        saveMeta(meta);
+        this.updateSaveIndicator();
+      }, 15000);
+    }
+
+    updateSaveIndicator(){
+      const savedAt = this.answers[this.questions[this.currentIndex]?.id]?.savedAt;
+      const el = this.saveIndicator;
+      if(savedAt) el.textContent = 'Saved at ' + new Date(savedAt).toLocaleTimeString();
+      else el.textContent = 'Not saved yet';
+    }
+
+    updateProgressUI(){
+      const total = this.questions.length;
+      const savedCount = this.questions.filter(q => (this.answers[q.id] && this.answers[q.id].savedAt)).length;
+      const fill = total ? Math.round( (savedCount/total)*100 ) : 0;
+      document.getElementById('progressFill').style.width = fill + '%';
+      document.getElementById('progressText').textContent = `${savedCount} / ${total} saved`;
+      document.getElementById('qNumText').textContent = `${Math.min(this.currentIndex+1, this.questions.length)} / ${this.questions.length}`;
+      // show submit if all saved or all visited
+      const allVisited = this.questions.length>0 && this.questions.every(q => (this.answers[q.id] && (this.answers[q.id].savedAt || this.answers[q.id].timedOut)));
+      document.getElementById('submitAllBtn').classList.toggle('hidden', !allVisited);
+      this.updateSaveIndicator();
+      this.updateSwitchUI();
+    }
+
+    updateSwitchUI(){
+      const sc = parseInt(localStorage.getItem(SWITCH_COUNT_KEY) || '0',10);
+      document.getElementById('remainingSwitches').textContent = `Remaining switches: ${Math.max(0, 2 - sc)}`;
+    }
+
+    renderQuestion(){
+      // load questions array
+      this.questions = loadQuestions() || [];
+      if(!this.questions.length){
+        this.promptArea.innerHTML = '<div class="muted">No questions available. Ask admin to add questions.</div>';
+        this.questionTitle.textContent = 'No Questions';
+        this.questionMeta.textContent = '';
+        document.getElementById('solutionBox').value = '';
+        return;
+      }
+      // clamp index
+      this.currentIndex = clamp(this.currentIndex, 0, this.questions.length - 1);
+      const q = this.questions[this.currentIndex];
+      document.getElementById('questionTitle').textContent = `Question ${this.currentIndex+1}`;
+      document.getElementById('questionMeta').innerHTML = `${q.type.toUpperCase()} — time limit ${q.timeLimitSeconds}s`;
+      // show prompt HTML
+      this.promptArea.innerHTML = q.prompt || '';
+      // load saved answer if any
+      const saved = this.answers[q.id];
+      this.solutionBox.value = saved ? (saved.answer || '') : '';
+      // timer display
+      const remain = this.timers[q.id] ?? q.timeLimitSeconds;
+      this.timerDisplay.textContent = formatTimeSec(remain);
+      // update save indicator
+      this.updateProgressUI();
+      // reflect locked state
+      const locked = localStorage.getItem(EXAM_STATUS_KEY) === 'locked_due_to_switches';
+      this.prevBtn.disabled = locked;
+      this.nextBtn.disabled = locked;
+      this.saveBtn.disabled = locked;
+      if(locked){
+        this.lockedMessage.classList.remove('hidden');
+      }else{
+        this.lockedMessage.classList.add('hidden');
+      }
+    }
+
+    go(delta){
+      if(localStorage.getItem(EXAM_STATUS_KEY) === 'locked_due_to_switches') return;
+      const newIndex = this.currentIndex + delta;
+      if(newIndex < 0 || newIndex >= this.questions.length) return;
+      this.currentIndex = newIndex;
+      this.renderQuestion();
+    }
+
+    markTimedOut(qid){
+      this.answers[qid] = this.answers[qid] || {};
+      this.answers[qid].timedOut = true;
+      this.answers[qid].savedAt = this.answers[qid].savedAt || nowISO();
+      saveAnswers(this.answers);
+      dispatchAppEvent('answersUpdated');
+    }
+
+    saveAnswer(qid, text, autosave=false){
+      this.answers[qid] = this.answers[qid] || {};
+      this.answers[qid].answer = text;
+      this.answers[qid].savedAt = nowISO();
+      this.answers[qid].autosaved = Boolean(autosave);
+      saveAnswers(this.answers);
+      dispatchAppEvent('answersUpdated');
+      this.updateProgressUI();
+    }
+
+    saveCurrentAnswer(){
+      const q = this.questions[this.currentIndex];
+      if(!q) return;
+      const text = this.solutionBox.value || '';
+      this.saveAnswer(q.id, text, false);
+      showToast('Saved');
+    }
+
+    async submitAll(){
+      if(localStorage.getItem(EXAM_STATUS_KEY) === 'locked_due_to_switches') {
+        alert('Exam locked. Cannot submit.');
+        return;
+      }
+      // gather all submission data
+      this.meta.endTime = nowISO();
+      saveMeta(this.meta);
+      const submission = {
+        sessionId: this.sessionId,
+        startTime: this.meta.startTime,
+        endTime: this.meta.endTime,
+        questions: this.questions,
+        answers: this.answers,
+        snapshots: loadSnapshots(),
+        switchCount: parseInt(localStorage.getItem(SWITCH_COUNT_KEY) || '0',10),
+        metadata: this.meta
+      };
+      // try emailjs (if configured) else fallback
+      try{
+        await EmailSender.send(submission);
+        localStorage.setItem(EXAM_STATUS_KEY, 'submitted');
+        // clear sensitive storage (but keep questions)
+        localStorage.removeItem(ANSWERS_KEY);
+        localStorage.removeItem(SNAPSHOTS_KEY);
+        localStorage.removeItem(SWITCH_COUNT_KEY);
+        showToast('Submission successful');
+        dispatchAppEvent('submitted');
+        // show confirmation
+        alert('Submission complete. Thank you.');
+      }catch(e){
+        console.error('Submission failed', e);
+        // fallback download
+        promptFallbackDownload(submission);
+      }
+    }
+
+    onLock(detail){
+      // disable UI
+      this.prevBtn.disabled = true;
+      this.nextBtn.disabled = true;
+      this.saveBtn.disabled = true;
+      this.submitAllBtn.disabled = false; // allow export evidence + submit maybe
+      this.lockedMessage.classList.remove('hidden');
+      // show export evidence button to user via prompt
+      if(confirm('Exam locked due to screen switching. Would you like to export evidence JSON now?')){
+        const meta = {
+          reason: detail && detail.reason,
+          sessionId: this.sessionId,
+          snapshots: loadSnapshots(),
+          switchCount: parseInt(localStorage.getItem(SWITCH_COUNT_KEY) || '0',10),
+          answers: loadAnswers()
+        };
+        const blob = new Blob([JSON.stringify(meta, null, 2)], {type:'application/json'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = 'exam_evidence.json';
+        document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      }
+    }
+  }
+
+  /* ------------------------
+     EmailSender - EmailJS integration + fallback
+     ------------------------ */
+  class EmailSender {
+    static async send(payload){
+      // Replace these placeholders with your EmailJS credentials if you want automatic emailing.
+      // TODO: Replace with your EmailJS service/template/public key.
+      const EMAILJS_SERVICE_ID = 'service_irr01db';
+      const EMAILJS_TEMPLATE_ID = 'template_qoaebh3';
+      const EMAILJS_USER_ID = '6aMaAdiAMkiEd71L7'; // public key
+
+      // If the placeholders aren't changed, do fallback
+      const placeholdersLeft = [EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, EMAILJS_USER_ID].some(s => s.includes('YOUR_'));
+      if(placeholdersLeft){
+        // direct fallback: ask user to download JSON
+        throw new Error('EmailJS not configured');
+      }else{
+        // attempt EmailJS send
+        // We include a simple payload mapping — EmailJS templates accept parameters like `message` or `subject`
+        // Please create a template in your EmailJS account that accepts `subject` and `message` fields.
+        const message = JSON.stringify(payload, null, 2);
+        // load emailjs (cdn approach) - but we cannot load external script here; instead assume it's included by user
+        // To use EmailJS, include their SDK in production and call emailjs.send
+        // emailjs.init(EMAILJS_USER_ID);
+        // return emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, { subject: `Exam submission ${payload.sessionId}`, message });
+        // Since this demo is single-file without external script, we'll throw to fallback unless user embeds EmailJS SDK.
+        throw new Error('EmailJS integration requires including EmailJS SDK and replacing placeholders.');
+      }
+    }
+
+    // Example server-side POST fallback (commented for developer):
+    // sendToServer(payload){
+    //   // POST to /submit endpoint on your own server that will handle email sending via secure SMTP
+    //   fetch('https://your-server.example.com/submit', {
+    //     method:'POST',
+    //     headers:{'Content-Type':'application/json'},
+    //     body: JSON.stringify(payload)
+    //   }).then(r=> r.json()).then(resp => console.log('server resp', resp));
+    // }
+  }
+
+  /* ------------------------
+     Helper functions for storage & snapshots
+     ------------------------ */
+  function loadQuestions(){ return safeParseJSON(localStorage.getItem(QUESTIONS_KEY)) || []; }
+  function loadAnswers(){ return safeParseJSON(localStorage.getItem(ANSWERS_KEY)) || {}; }
+  function saveAnswers(obj){ localStorage.setItem(ANSWERS_KEY, JSON.stringify(obj)); }
+  function loadSnapshots(){ return safeParseJSON(localStorage.getItem(SNAPSHOTS_KEY)) || []; }
+  function saveSnapshots(arr){ localStorage.setItem(SNAPSHOTS_KEY, JSON.stringify(arr)); }
+  function loadMeta(){ return safeParseJSON(localStorage.getItem(METADATA_KEY)) || null; }
+  function saveMeta(m){ localStorage.setItem(METADATA_KEY, JSON.stringify(m)); }
+  function promptFallbackDownload(payload){
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = `submission_${payload.sessionId}.json`;
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    alert('EmailJS not configured. Downloaded submission JSON. Send it manually to your email.');
+  }
+
+  /* ------------------------
+     UI wiring & app initialization
+     ------------------------ */
+  // Elements for view switch
+  const adminBtn = document.getElementById('adminBtn');
+  const examBtn = document.getElementById('examBtn');
+  const adminView = document.getElementById('adminView');
+  const examView = document.getElementById('examView');
+
+  function showAdmin(){
+    adminBtn.setAttribute('aria-pressed', 'true'); examBtn.setAttribute('aria-pressed','false');
+    adminView.setAttribute('aria-hidden','false'); examView.setAttribute('aria-hidden','true');
+    adminView.style.display = 'block'; examView.style.display = 'none';
+  }
+  function showExam(){
+    adminBtn.setAttribute('aria-pressed', 'false'); examBtn.setAttribute('aria-pressed','true');
+    adminView.setAttribute('aria-hidden','true'); examView.setAttribute('aria-hidden','false');
+    adminView.style.display = 'none'; examView.style.display = 'block';
+  }
+
+  // dispatch custom app events
+  function dispatchAppEvent(name, detail={}){
+    document.dispatchEvent(new CustomEvent(name, { detail }));
+  }
+
+  // instantiate managers
+  const admin = new AdminManager();
+  const camera = new CameraManager();
+  const cheat = new CheatDetector(camera);
+  let exam = null;
+
+  // initialize view: default to Exam
+  showExam();
+
+  // view toggle handlers
+  adminBtn.addEventListener('click', ()=> showAdmin());
+  examBtn.addEventListener('click', async ()=>{
+    showExam();
+    // when switching to exam, request camera if not yet requested
+    try{
+      await camera.requestCamera();
+    }catch(e){
+      // camera denied - show retry and message inside UI (simple alert for demo)
+      if(confirm('Camera access is required for the exam. Retry permission?')){
+        try{ await camera.requestCamera(); } catch(err){ alert('Camera still denied. Exam cannot proceed without camera.'); }
+      }else{
+        alert('Camera is necessary. You can retry from the Camera controls in the sidebar.');
+      }
+    }
+
+    // instantiate exam manager if not already
+    if(!exam){
+      exam = new ExamManager(camera, cheat);
+    } else {
+      // update questions in case admin modified them
+      exam.questions = loadQuestions() || [];
+      exam.renderQuestion();
+    }
+  });
+
+  // export/import shortcuts
+  document.getElementById('exportAllBtn').addEventListener('click', ()=> admin.exportJSON());
+  document.getElementById('importAllBtn').addEventListener('click', ()=> document.getElementById('importFile').click());
+
+  // handle exported questions from admin
+  document.addEventListener('questionsUpdated', ()=>{
+    // if an exam exists, update it
+    if(exam) { exam.questions = loadQuestions() || []; exam.initTimersFromQuestions(); exam.updateProgressUI(); exam.renderQuestion(); }
+  });
+
+  // initial camera attempt on page load might be deferred until exam view load per requirement
+  // However we'll attach toggle to request later.
+
+  // import button wiring (global)
+  document.getElementById('pickImportBtn').addEventListener('click', ()=> document.getElementById('importFile').click());
+  document.getElementById('exportQuestionsBtn').addEventListener('click', ()=> admin.exportJSON());
+  document.getElementById('seedExampleBtn').addEventListener('click', ()=> admin.seedDemo());
+
+  // exportAllBtn (sidebar) reuses admin.exportJSON
+  document.getElementById('exportAllBtn').addEventListener('click', ()=> admin.exportJSON());
+
+  // cheat / switch counter UI initial update
+  document.dispatchEvent(new CustomEvent('switchCountUpdated'));
+
+  // global save indicator updates
+  document.addEventListener('answersUpdated', ()=> {
+    const ind = document.getElementById('saveIndicator');
+    if(ind && exam) exam.updateSaveIndicator();
+    if(exam) exam.updateProgressUI();
+  });
+
+  // reset function in console for debugging
+  window.__examapp_reset_all = function(){
+    if(!confirm('Reset all exam data (questions, answers, snapshots)?')) return;
+    localStorage.removeItem(QUESTIONS_KEY);
+    localStorage.removeItem(ANSWERS_KEY);
+    localStorage.removeItem(SNAPSHOTS_KEY);
+    localStorage.removeItem(SWITCH_COUNT_KEY);
+    localStorage.removeItem(EXAM_STATUS_KEY);
+    localStorage.removeItem(METADATA_KEY);
+    localStorage.removeItem(SESSION_ID_KEY);
+    showToast('All data cleared. Reloading...');
+    setTimeout(()=> location.reload(), 600);
+  };
+
+  // wire import file global
+  document.getElementById('importFile').addEventListener('change', (ev)=>{
+    const f = ev.target.files[0];
+    if(!f) return;
+    const r = new FileReader();
+    r.onload = ()=>{
+      try{
+        const data = JSON.parse(r.result);
+        admin.importFromJSON(data);
+        showToast('Imported questions');
+      }catch(e){ alert('Invalid JSON'); }
+    };
+    r.readAsText(f);
+  });
+
+  // expose small helper to export answers for admin
+  document.getElementById('exportAllBtn').addEventListener('click', ()=>{
+    const data = {
+      questions: loadQuestions(),
+      answers: loadAnswers(),
+      snapshots: loadSnapshots(),
+      switchCount: parseInt(localStorage.getItem(SWITCH_COUNT_KEY) || '0',10),
+      meta: loadMeta()
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'exam_full_dump.json';
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  });
+
+  // UI: importAllBtn toggles file picker
+  document.getElementById('importAllBtn').addEventListener('click', ()=> document.getElementById('importFile').click());
+
+  // When the page first loads, seed sample data if no questions exist for immediate demo
+  if(!loadQuestions().length){
+    admin.seedDemo();
+  }
+
+  // update switch UI display area
+  document.addEventListener('switchCountUpdated', ()=> {
+    const sc = parseInt(localStorage.getItem(SWITCH_COUNT_KEY) || '0',10);
+    document.getElementById('switchCounterBadge').textContent = `Switches ${sc}/2`;
+  });
+
+  // small accessibility: keyboard shortcuts
+  document.addEventListener('keydown', (e)=>{
+    if(e.altKey && e.code === 'ArrowRight'){ document.getElementById('nextBtn').click(); }
+    if(e.altKey && e.code === 'ArrowLeft'){ document.getElementById('prevBtn').click(); }
+    if(e.ctrlKey && e.key.toLowerCase() === 's'){ e.preventDefault(); document.getElementById('saveBtn').click(); }
+  });
+
+})();
+</script>
+</body>
+</html>
